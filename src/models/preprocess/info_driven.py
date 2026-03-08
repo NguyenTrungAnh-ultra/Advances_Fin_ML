@@ -3,20 +3,14 @@ import numpy as np
 from datetime import timedelta
 import os
 import sys
-
-# Lấy thư mục hiện hành của Jupyter Notebook
+from numba import jit
 current_dir = os.getcwd()
-# Lên 3 cấp để chỉ định thư mục gốc của dự án (chứa thư mục 'src')
 project_root = os.path.abspath(os.path.join(current_dir, '..', '..', '..'))
-# Thêm thư mục project_root vào sys.path để có thể Import các module từ src
 if project_root not in sys.path:
     sys.path.append(project_root)
 
-# Handle import gracefully for test executions
-try:
-    from src.utils import math_engines
-except ImportError:
-    pass
+from src.utils import math_engines
+
 
 class TimeBar:
     @staticmethod
@@ -179,16 +173,26 @@ class DollarBar:
                 df['typical_price'] = (df['open'] + df['high'] + df['low'] + df['close']) / 4.0
             df[col_dollar] = df['typical_price'] * df['volume']
 
-        # SỬA LỖI 1: Chuẩn MLFinLab. Dùng giá (Close) để xác định Tick Direction
+        # Chuẩn MLFinLab. Dùng giá (Close) để xác định Tick Direction
         df['b_t'] = TIBs(df['close'])
         
         # Lọc bỏ row khuyết ban đầu
         df.dropna(subset=['b_t', col_dollar], inplace=True)
         
-        # SỬA LỖI 3: Mồi dữ liệu (Warm-up Phase)
+        # Mồi dữ liệu (Warm-up Phase)
         df_warmup = df.head(initial_T_guess * 5)
         if len(df_warmup) == 0:
             raise ValueError("[Imbalance Bars] Data rỗng, không đủ mồi ngưỡng!")
+        
+        @jit(nopython=True, nogil=True)
+        def fast_streaming_ewma(arr_in, initial_state, alpha):
+            """
+            Numba-accelerated streaming EWMA tick-by-tick
+            """
+            state = initial_state
+            for i in range(arr_in.shape[0]):
+                state = (alpha * arr_in[i]) + ((1.0 - alpha) * state)
+            return state
 
         class ImbalanceThresholdEngine:
             def __init__(self, df_warmup, initial_T_guess, span=3):
@@ -198,9 +202,7 @@ class DollarBar:
                 # Khởi tạo EWMA cho b_v bằng chuỗi quá khứ thay vì np.mean() cục bộ
                 tick_imbalance_array = (df_warmup['b_t'] * df_warmup[col_dollar]).dropna().values
                 if len(tick_imbalance_array) > 0:
-                    self.expected_b_v = tick_imbalance_array[0]
-                    for x in tick_imbalance_array[1:]:
-                        self.expected_b_v = (self.alpha * x) + ((1 - self.alpha) * self.expected_b_v)
+                    self.expected_b_v = fast_streaming_ewma(tick_imbalance_array[1:], tick_imbalance_array[0], self.alpha)
                 else:
                     self.expected_b_v = 0.0
                 
@@ -210,14 +212,15 @@ class DollarBar:
                 self.initial_threshold = self.expected_T * np.abs(self.expected_b_v)
                 self.current_threshold = self.initial_threshold
                 # Sàn = x0.1 hoặc một con số fixed ***********************************************************
-                self.floor = max(self.initial_threshold * 0.1, 100.0) 
+                self.floor = max(self.initial_threshold * 0.1, df_warmup['typical_price'].median()*0.1)
                 
             def update_threshold(self, actual_T, actual_tick_imbalance_array): # KHI UPDATE
                 self.expected_T = (self.alpha * actual_T) + ((1 - self.alpha) * self.expected_T)
                 
-                # Cập nhật EWMA LUYẾN TUYẾN tick-by-tick bảo toàn decay
-                for x in actual_tick_imbalance_array:
-                    self.expected_b_v = (self.alpha * x) + ((1 - self.alpha) * self.expected_b_v)
+                # Cập nhật EWMA LUYẾN TUYẾN tick-by-tick bảo toàn decay (Accelerated by Numba)
+                if len(actual_tick_imbalance_array) > 0:
+                    arr_in = np.array(actual_tick_imbalance_array, dtype=np.float64)
+                    self.expected_b_v = fast_streaming_ewma(arr_in, self.expected_b_v, self.alpha)
                 
                 # ÁP DỤNG NGƯỠNG FLOOR để chống Death spiral
                 raw_threshold = self.expected_T * np.abs(self.expected_b_v)
@@ -250,7 +253,6 @@ class DollarBar:
 
         for i in range(len(df_warmup), len(times)):
             current_datetime = times[i]
-            
             price = closes[i] 
             volume = volumes[i]
             dollar_val = dollar_values[i]
