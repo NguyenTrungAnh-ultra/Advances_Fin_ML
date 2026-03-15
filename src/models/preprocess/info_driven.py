@@ -308,6 +308,10 @@ class DollarBar:
         print(f"[Imbalance Bars] Hoàn tất. Mẫu: {len(imbalance_bars_df)} thanh.")
         return imbalance_bars_df
 
+    @staticmethod
+    def runs_bar():
+        pass
+
 if __name__ == '__main__':
     print("=" * 60)
     print("TESTING MLFINLAB BAR ENGINES WITH REAL DATA (FPT)")
